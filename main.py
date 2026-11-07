@@ -1,27 +1,10 @@
 #!/usr/bin/env python3
-"""Claude Code plugin for sijba — standalone, no dependency on
-sijba-agent-controller's own code. Runnable on its own (env vars below) or
-spawned by the controller as a `kind: git` catalog plugin.
+"""Claude Remote Control plugin for sijba — keeps a `claude remote-control`
+server alive, mirrors phone/chat prompts and answers into the sijba channel via
+`post`, and relays sijba messages into the active RC session with a small
+haiku helper (SendMessage only).
 
-Plugin contract (documented in sijba-agent-controller/README.md):
-  - read SIJBA_URL / SIJBA_TOKEN / PROJECT_NAME / WORK_DIR / REGISTRY_FILE
-    from the environment
-  - self-register exactly one sijba channel over its own WebSocket connection
-  - handle /archive and /pause locally: write REGISTRY_FILE's own status
-    entry directly (no shared import — see _set_registry_status below) and
-    exit with the reserved code (90 archived / 91 paused) *before* the
-    process actually stops, so the controller can tell "stopped on
-    purpose" apart from "crashed" purely from the exit code
-  - handle /log [n] locally from an in-memory ring buffer
-
-Environment variables
-----------------------
-SIJBA_URL       sijba WebSocket URL (required) — e.g. wss://<account>.sijba.eu
-SIJBA_TOKEN     Auth token (required)
-PROJECT_NAME    Registry key / trigger word (required) — e.g. "sijba-web"
-WORK_DIR        Working directory for Claude (required)
-REGISTRY_FILE   Path to the controller's registry.json (required)
-CLAUDE_CMD      Claude CLI command (default: claude)
+Plugin contract: sijba-agent-controller/README.md (env vars, /archive, /pause).
 """
 from __future__ import annotations
 
@@ -30,7 +13,10 @@ import collections
 import fcntl
 import json
 import os
+import re
+import shlex
 import signal
+import subprocess
 import sys
 import time
 import urllib.error
@@ -40,40 +26,41 @@ from pathlib import Path
 
 import websockets
 
-# Exit-code contract with the controller — see sijba-agent-controller/exit_codes.py.
 EXIT_ARCHIVED = 90
 EXIT_PAUSED = 91
 
-PLUGIN_NAME = "claude"  # this repo *is* the claude plugin — no TOOL switch needed
+PLUGIN_NAME = "remote-control"
 
 SIJBA_URL = os.environ.get("SIJBA_URL", "")
-if not SIJBA_URL:
-    print("ERROR: SIJBA_URL environment variable required (e.g. wss://<account>.sijba.eu)", file=sys.stderr)
-    sys.exit(1)
-
 SIJBA_TOKEN = os.environ.get("SIJBA_TOKEN", "")
 PROJECT_NAME = os.environ.get("PROJECT_NAME", "")
 WORK_DIR = Path(os.environ.get("WORK_DIR", ""))
 REGISTRY_FILE = os.environ.get("REGISTRY_FILE", "")
 CLAUDE_CMD = os.environ.get("CLAUDE_CMD", "claude")
 
-if not SIJBA_TOKEN:
-    print("ERROR: SIJBA_TOKEN environment variable required", file=sys.stderr)
-    sys.exit(1)
-if not PROJECT_NAME:
-    print("ERROR: PROJECT_NAME environment variable required", file=sys.stderr)
-    sys.exit(1)
-if not WORK_DIR.is_dir():
-    print(f"ERROR: WORK_DIR {WORK_DIR} does not exist", file=sys.stderr)
-    sys.exit(1)
-if not REGISTRY_FILE:
-    print("ERROR: REGISTRY_FILE environment variable required", file=sys.stderr)
+BOT_FLUSH_IDLE_SEC = 15
+SERVER_WATCH_SEC = 30
+SESSION_SCAN_SEC = 2
+MAX_CHARS_TO_UI = 8000
+
+FALLBACK_SUBTYPES = ("model_fallback", "model_refusal_fallback", "model_consent_fallback")
+
+if not SIJBA_URL or not SIJBA_TOKEN or not PROJECT_NAME or not WORK_DIR.is_dir() or not REGISTRY_FILE:
+    print("ERROR: need SIJBA_URL, SIJBA_TOKEN, PROJECT_NAME, WORK_DIR (dir), REGISTRY_FILE", file=sys.stderr)
     sys.exit(1)
 
 PLUGIN_ID = f"{PLUGIN_NAME}-{PROJECT_NAME}"
 CHANNEL_ID = f"{PLUGIN_NAME}:{PROJECT_NAME}"
+TMUX_SESSION = f"sijba-{PROJECT_NAME}"
+SESSIONS_DIR = Path.home() / ".claude" / "sessions"
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
 _LOG_BUFFER: collections.deque[str] = collections.deque(maxlen=200)
+_AGENT_ENV_STRIP = ("SIJBA_TOKEN", "SIJBA_URL", "REGISTRY_FILE")
+
+
+def _agent_env() -> dict:
+    return {k: v for k, v in os.environ.items() if k not in _AGENT_ENV_STRIP}
 
 
 def _log(msg: str) -> None:
@@ -83,10 +70,13 @@ def _log(msg: str) -> None:
     print(line, flush=True)
 
 
+def _truncate(text: str, limit: int = MAX_CHARS_TO_UI) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n…[truncated, {len(text) - limit} more chars]"
+
+
 def _set_registry_status(name: str, status: str) -> None:
-    """Read-modify-write REGISTRY_FILE directly — same JSON shape as
-    sijba-agent-controller/registry.py, but no import of it: this repo has
-    to stand on its own, same as any other git-sourced plugin would."""
     path = Path(REGISTRY_FILE)
     with open(path, "r+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
@@ -102,61 +92,353 @@ def _set_registry_status(name: str, status: str) -> None:
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
+def _cwd_slug(cwd: Path) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "-", str(cwd.resolve()))
+
+
+def _jsonl_path(session_id: str) -> Path:
+    return PROJECTS_DIR / _cwd_slug(WORK_DIR) / f"{session_id}.jsonl"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def _is_descendant(child: int, ancestor: int) -> bool:
+    pid = child
+    while pid > 1:
+        if pid == ancestor:
+            return True
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().split()[3])
+        except (FileNotFoundError, ProcessLookupError, IndexError, ValueError):
+            break
+    return False
+
+
+def _base_model(model_id: str) -> str:
+    return re.sub(r"(\[.*\]|-\d{8})$", "", model_id.strip().lower())
+
+
+def _first(event: dict, *keys: str) -> str:
+    return next((str(event[k]) for k in keys if event.get(k)), "")
+
+
+def _tmux(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["tmux", *args], capture_output=True, text=True)
+
+
+def _tmux_has_session() -> bool:
+    return _tmux("has-session", "-t", TMUX_SESSION).returncode == 0
+
+
+def _pane_pid() -> int | None:
+    r = _tmux("list-panes", "-t", TMUX_SESSION, "-F", "#{pane_pid}")
+    if r.returncode != 0:
+        return None
+    line = (r.stdout or "").strip().splitlines()
+    if not line:
+        return None
+    try:
+        return int(line[0])
+    except ValueError:
+        return None
+
+
 # ---------------------------------------------------------------------------
-# Claude backend (one-shot `claude -p --resume` per turn, streamed)
-#
-# Earlier versions of this class tried to keep one persistent `claude`
-# process alive and feed it a made-up {"request_id", "text"} JSON protocol
-# over stdin — claude never spoke that protocol at all (verified live: it
-# was actually launching full interactive mode against piped, non-tty
-# stdin/stdout, understanding none of what was written to it), so every
-# single message timed out after 120s with no exception. The real
-# non-interactive interface is `-p --output-format stream-json --verbose`
-# (verbose is mandatory for print+stream-json, claude errors out without
-# it) plus `--resume <session_id>` for continuation — one invocation per
-# turn, same shape as CursorSession below, confirmed against a real
-# `claude -p` run.
+# Remote-control server (tmux + claude remote-control)
 # ---------------------------------------------------------------------------
 
-# Chat bubbles aren't the place for a raw multi-KB/MB blob (a tool result
-# embedding a big file read, a huge diff, ...) — cap what actually reaches
-# sijba, independent of how large the underlying event was.
-MAX_CHARS_TO_UI = 8000
+class RemoteControlServer:
+    def __init__(self) -> None:
+        self.root_pid: int | None = None
+        self._wrap_proc: asyncio.subprocess.Process | None = None
 
-
-def _truncate(text: str, limit: int = MAX_CHARS_TO_UI) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"\n…[truncated, {len(text) - limit} more chars]"
-
-
-async def _iter_json_lines(stream: asyncio.StreamReader):
-    """Yield complete newline-delimited lines with no hard size limit.
-
-    `StreamReader.readline()` has a fixed buffer limit (64KiB by default)
-    and *raises* LimitOverrunError if a single line exceeds it before the
-    separator is found — which happened live: a JSON-lines event with a
-    large embedded file/diff blew past that, and the exception replaced
-    the whole in-progress reply with an error instead of just being one
-    long event. Read raw chunks and split on our own unbounded buffer
-    instead — a huge line just accumulates in memory (bounded only by
-    what's actually available, not an arbitrary fixed ceiling) rather than
-    blowing up the read.
-    """
-    buf = bytearray()
-    while True:
-        chunk = await stream.read(65536)
-        if not chunk:
-            if buf:
-                yield bytes(buf)
+    async def ensure(self) -> None:
+        pid = _pane_pid() if _tmux_has_session() else None
+        if pid and _pid_alive(pid):
+            self.root_pid = pid
             return
-        buf.extend(chunk)
+        await self._spawn()
+
+    async def _spawn(self) -> None:
+        argv = [
+            CLAUDE_CMD, "remote-control", "--name", PROJECT_NAME,
+            "--permission-mode", "auto", "--capacity", "2", "--spawn=same-dir",
+        ]
+        inner = " ".join(shlex.quote(a) for a in argv)
+        tmux_cmd = (
+            f"tmux new-session -A -s {shlex.quote(TMUX_SESSION)} "
+            f"-c {shlex.quote(str(WORK_DIR))} {inner}"
+        )
+        env = dict(os.environ)
+        env.setdefault("TERM", "xterm-256color")
+        self._wrap_proc = await asyncio.create_subprocess_exec(
+            "script", "-qc", tmux_cmd, "/dev/null",
+            cwd=str(WORK_DIR), env=env,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        for _ in range(40):
+            await asyncio.sleep(0.25)
+            pid = _pane_pid()
+            if pid and _pid_alive(pid):
+                self.root_pid = pid
+                _log(f"remote-control server ready (tmux pane pid={pid})")
+                return
+        raise RuntimeError("remote-control server did not start in tmux")
+
+    async def watch(self) -> None:
         while True:
-            idx = buf.find(b"\n")
-            if idx < 0:
-                break
-            yield bytes(buf[:idx])
-            del buf[: idx + 1]
+            await asyncio.sleep(SERVER_WATCH_SEC)
+            try:
+                pid = _pane_pid() if _tmux_has_session() else None
+                if pid and _pid_alive(pid):
+                    self.root_pid = pid
+                    continue
+                _log("remote-control server missing — respawning")
+                await self.ensure()
+            except Exception as exc:
+                _log(f"server watch error: {exc}")
+
+
+def _owned_sessions(root_pid: int | None) -> list[dict]:
+    if not root_pid:
+        return []
+    out: list[dict] = []
+    work = WORK_DIR.resolve()
+    try:
+        paths = list(SESSIONS_DIR.glob("*.json"))
+    except OSError:
+        return []
+    for path in paths:
+        try:
+            meta = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        pid = meta.get("pid")
+        if not isinstance(pid, int) or not _pid_alive(pid):
+            continue
+        if not _is_descendant(pid, root_pid):
+            continue
+        try:
+            if Path(meta.get("cwd", "")).resolve() != work:
+                continue
+        except OSError:
+            continue
+        out.append(meta)
+    return out
+
+
+def _active_session(sessions: list[dict]) -> dict | None:
+    best: dict | None = None
+    best_mtime = 0.0
+    for s in sessions:
+        p = _jsonl_path(s["sessionId"])
+        if not p.exists():
+            continue
+        m = p.stat().st_mtime
+        if m >= best_mtime:
+            best_mtime = m
+            best = s
+    return best
+
+
+# ---------------------------------------------------------------------------
+# JSONL mirror → sijba post
+# ---------------------------------------------------------------------------
+
+def _user_text_from_event(d: dict) -> str | None:
+    origin = d.get("origin") or {}
+    if origin.get("kind") == "peer":
+        return None
+    if d.get("type") == "user":
+        if origin.get("kind") != "human":
+            return None
+        content = (d.get("message") or {}).get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if isinstance(content, list):
+            parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+            text = "".join(parts).strip()
+            return text or None
+        return None
+    if d.get("type") == "attachment":
+        att = d.get("attachment") or {}
+        if att.get("type") != "queued_command":
+            return None
+        if (att.get("origin") or {}).get("kind") != "human":
+            return None
+        prompt = att.get("prompt")
+        return str(prompt).strip() if prompt else None
+    return None
+
+
+def _assistant_text_blocks(d: dict) -> list[str]:
+    if d.get("type") != "assistant":
+        return []
+    content = (d.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return []
+    return [b.get("text", "") for b in content if b.get("type") == "text" and b.get("text")]
+
+
+class SessionMirror:
+    """Tails one session's jsonl from the current EOF — no history replay."""
+
+    def __init__(self, client: "PluginClient", meta: dict, multi: bool) -> None:
+        self.client = client
+        self.meta = meta
+        self.session_id = meta["sessionId"]
+        self.display_name = str(meta.get("name") or self.session_id[:8])
+        self.multi = multi
+        self.path = _jsonl_path(self.session_id)
+        self.offset = self.path.stat().st_size if self.path.exists() else 0
+        self.pending: list[str] = []
+        self.last_text_at = 0.0
+        self.turn_model: str | None = None
+        self.last_served: str | None = None
+        self.warnings: list[str] = []
+
+    def _fmt(self, text: str) -> str:
+        if self.multi:
+            return f"[{self.display_name}] {text}"
+        return text
+
+    async def _post_user(self, text: str) -> None:
+        await self._flush_bot()
+        await self.client.post("user", self._fmt(f"📱 {text}"), source="phone")
+
+    async def _flush_bot(self, extra: str = "") -> None:
+        if not self.pending and not extra and not self.warnings:
+            return
+        body = "".join(self.pending).strip()
+        self.pending.clear()
+        if self.warnings:
+            body = ("\n\n".join([*self.warnings, body]) if body else "\n\n".join(self.warnings))
+            self.warnings.clear()
+        if extra:
+            body = f"{body}\n\n{extra}".strip() if body else extra
+        if not body:
+            return
+        await self.client.post("bot", self._fmt(_truncate(body)), source="claude")
+
+    async def _note_model(self, model: str) -> None:
+        if self.turn_model and model and _base_model(model) != _base_model(self.turn_model):
+            self.warnings.append(f"⚠️ model changed: {self.turn_model} → {model}")
+        self.turn_model = model
+
+    async def _handle_line(self, d: dict) -> None:
+        user = _user_text_from_event(d)
+        if user:
+            await self._post_user(user)
+            self.turn_model = None
+            return
+
+        if d.get("type") == "system":
+            subtype = d.get("subtype")
+            if subtype in FALLBACK_SUBTYPES:
+                to = _first(d, "fallback_model", "fallbackModel", "to_model", "toModel")
+                frm = _first(d, "original_model", "originalModel", "from_model", "fromModel")
+                self.warnings.append(f"⚠️ model fallback: {frm or '?'} → {to or '?'}")
+            return
+
+        texts = _assistant_text_blocks(d)
+        if texts:
+            model = (d.get("message") or {}).get("model") or ""
+            if model:
+                await self._note_model(model)
+                self.last_served = model
+            self.pending.extend(texts)
+            self.last_text_at = time.monotonic()
+
+        msg = d.get("message") or {}
+        if d.get("type") == "assistant" and msg.get("stop_reason") == "end_turn":
+            note = ""
+            if self.turn_model and self.last_served and _base_model(self.turn_model) != _base_model(self.last_served):
+                note = f"⚠️ answered by {self.last_served} (started as {self.turn_model})"
+            await self._flush_bot(note)
+
+    async def poll(self) -> None:
+        if not self.path.exists():
+            return
+        size = self.path.stat().st_size
+        if size < self.offset:
+            self.offset = 0
+        if size == self.offset:
+            if self.pending and time.monotonic() - self.last_text_at >= BOT_FLUSH_IDLE_SEC:
+                await self._flush_bot()
+            return
+        with open(self.path, "rb") as f:
+            f.seek(self.offset)
+            chunk = f.read(size - self.offset)
+        end = chunk.rfind(b"\n")
+        if end < 0:
+            return
+        self.offset += end + 1
+        for raw in chunk[:end].splitlines():
+            try:
+                d = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            await self._handle_line(d)
+        if self.pending and time.monotonic() - self.last_text_at >= BOT_FLUSH_IDLE_SEC:
+            await self._flush_bot()
+
+
+# ---------------------------------------------------------------------------
+# Relay sijba → active RC session (haiku SendMessage helper)
+# ---------------------------------------------------------------------------
+
+def _relay_prompt(session_name: str, text: str) -> str:
+    return (
+        "Deliver a cross-session message using only SendMessage (use ToolSearch to find it if needed). "
+        f"Send to the Claude Code session named {session_name!r}. "
+        "The message body must be exactly:\n\n"
+        f"Robert via sijba: {text}\n\n"
+        "Do not use shell or any other tools."
+    )
+
+
+async def relay_to_session(session_name: str, text: str) -> tuple[bool, str]:
+    prompt = _relay_prompt(session_name, text)
+    cmd = [
+        CLAUDE_CMD, "-p", "--model", "haiku", "--permission-mode", "dontAsk",
+        "--allowedTools", "SendMessage", "ToolSearch",
+        "--output-format", "json", prompt,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=str(WORK_DIR), env=_agent_env(),
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return False, "relay helper timed out"
+    err = stderr.decode(errors="replace").strip()
+    if proc.returncode != 0:
+        return False, err or f"exit {proc.returncode}"
+    if err:
+        _log(f"relay stderr: {err[:200]}")
+    return True, "ok"
+
+
+# ---------------------------------------------------------------------------
+# sijba plugin WebSocket client
+# ---------------------------------------------------------------------------
+
+def _strip_trigger(text: str) -> str:
+    for trigger in (f"@{CHANNEL_ID}", f"@{PROJECT_NAME}", CHANNEL_ID, PROJECT_NAME):
+        if text.lower().startswith(trigger.lower()):
+            return text[len(trigger):].strip()
+    return text.strip()
 
 
 def _http_base() -> str:
@@ -164,23 +446,15 @@ def _http_base() -> str:
 
 
 def _download_attachment(url: str, token: str, dest: Path) -> None:
-    # Explicit User-Agent required: urllib's default ("Python-urllib/x.y")
-    # gets a 403 from the WAF in front of sijba before the request ever
-    # reaches Core's own auth check — verified live (curl with the same
-    # bearer token but its own UA reaches the app fine and gets a normal
-    # 401/404; the bare Python UA gets 403 regardless of the header).
     req = urllib.request.Request(
         url,
-        headers={"Authorization": f"Bearer {token}", "User-Agent": "sijba-claude-plugin/1.0"},
+        headers={"Authorization": f"Bearer {token}", "User-Agent": "sijba-claude-remote-control/1.0"},
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         dest.write_bytes(resp.read())
 
 
 async def _fetch_attachments(attachments: list, work_dir: Path) -> list[str]:
-    """Download attachments from Core into work_dir/sijba-uploads — this
-    plugin's process runs on its own host, no filesystem shared with Core,
-    so the file has to be pulled over HTTP before claude can see it."""
     if not attachments:
         return []
     dest_dir = work_dir / "sijba-uploads"
@@ -193,191 +467,57 @@ async def _fetch_attachments(attachments: list, work_dir: Path) -> list[str]:
         try:
             await asyncio.to_thread(_download_attachment, url, SIJBA_TOKEN, dest)
             fetched.append(f"sijba-uploads/{filename}")
-            _log(f"downloaded attachment: {filename}")
         except (urllib.error.URLError, OSError, KeyError) as exc:
             _log(f"attachment download failed ({filename}): {exc}")
     return fetched
 
 
-class ClaudeSession:
-    def __init__(self, work_dir: Path):
-        self.work_dir = work_dir
-        self.claude_session_id: str | None = None
-        self.current_proc: asyncio.subprocess.Process | None = None
-
-    async def start(self):
-        _log("Claude session ready (conversation mode)")
-
-    async def send(self, text: str, request_id: int, on_chunk=None) -> dict:
-        cmd = [
-            CLAUDE_CMD, "-p", "--dangerously-skip-permissions", "--model", "sonnet",
-            "--output-format", "stream-json", "--include-partial-messages", "--verbose",
-        ]
-        if self.claude_session_id:
-            cmd += ["--resume", self.claude_session_id]
-        cmd += [text]
-
-        proc = None
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=self.work_dir,
-            )
-            self.current_proc = proc
-            final_text = ""
-            stderr_buf = bytearray()
-
-            async def _pump_stdout() -> None:
-                nonlocal final_text
-                async for line in _iter_json_lines(proc.stdout):
-                    try:
-                        event = json.loads(line)
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        continue
-                    etype = event.get("type")
-
-                    if etype == "system" and event.get("subtype") == "init":
-                        if event.get("session_id"):
-                            self.claude_session_id = event["session_id"]
-
-                    elif etype == "stream_event":
-                        inner = event.get("event") or {}
-                        if inner.get("type") == "content_block_delta":
-                            delta_text = (inner.get("delta") or {}).get("text", "")
-                            if delta_text and on_chunk:
-                                await on_chunk(_truncate(delta_text))
-
-                    elif etype == "result":
-                        final_text = _truncate(event.get("result", ""))
-                        if event.get("session_id"):
-                            self.claude_session_id = event["session_id"]
-
-            async def _pump_stderr() -> None:
-                while True:
-                    chunk = await proc.stderr.read(4096)
-                    if not chunk:
-                        break
-                    stderr_buf.extend(chunk)
-
-            await asyncio.wait_for(
-                asyncio.gather(_pump_stdout(), _pump_stderr()), timeout=600
-            )
-            await proc.wait()
-
-            stderr_text = bytes(stderr_buf).decode(errors="replace").strip()
-            if stderr_text:
-                _log(f"stderr: {stderr_text}")
-
-            # claude exited non-zero with no `result` (login expired, quota,
-            # crash, broken --resume, ...) — surface the real error instead of
-            # "(no output)", and drop the session id so the next turn starts
-            # clean rather than re-resuming a bad state.
-            if proc.returncode != 0 and not final_text:
-                self.claude_session_id = None
-                detail = stderr_text or f"exited {proc.returncode}, no output"
-                _log(f"invocation failed (exit {proc.returncode}) — session reset")
-                return {
-                    "text": f"Error: claude failed — {_truncate(detail, 800)}",
-                    "request_id": request_id,
-                }
-
-            return {"text": final_text or "(no output)", "request_id": request_id}
-
-        except asyncio.TimeoutError:
-            if proc and proc.returncode is None:
-                proc.kill()
-            return {"text": "Error: Claude timeout (600s)", "request_id": request_id}
-        except Exception as exc:
-            if proc and proc.returncode is None:
-                proc.kill()
-            return {"text": f"Error: {exc}", "request_id": request_id}
-        finally:
-            self.current_proc = None
-
-    async def close(self):
-        _log("Claude session closed")
-
-    async def reset(self) -> None:
-        """Drop the remembered session id — the next turn omits --resume,
-        so claude starts a brand-new conversation instead of continuing."""
-        self.claude_session_id = None
-        _log("Claude session reset")
-
-    async def kill(self) -> bool:
-        """Abort whatever turn is currently running, then reset — same
-        effect as /reset, plus actually terminating a still-running claude
-        invocation instead of waiting it out. Returns whether anything was
-        actually running to kill."""
-        proc = self.current_proc
-        killed = bool(proc and proc.returncode is None)
-        if killed:
-            proc.kill()
-        await self.reset()
-        return killed
-
-
-# ---------------------------------------------------------------------------
-# sijba plugin protocol (single project channel, self-registered)
-# ---------------------------------------------------------------------------
-
-def _strip_trigger(text: str) -> str:
-    for trigger in (PROJECT_NAME, CHANNEL_ID):
-        if text.lower().startswith(trigger.lower()):
-            return text[len(trigger):].strip()
-    return text.strip()
-
-
-def _is_kill_command(text: str) -> bool:
-    stripped = _strip_trigger(text)
-    if not stripped.startswith("/"):
-        return False
-    cmd, _, _ = stripped[1:].partition(" ")
-    return cmd.lower().strip() == "kill"
-
-
 class PluginClient:
-    def __init__(self):
+    def __init__(self) -> None:
         self.ws = None
-        self.session = ClaudeSession(WORK_DIR)
-        self.session_started = False
         self.shutdown_event = asyncio.Event()
         self.exit_code = 0
         self._reconnect_backoff = 5
-        self._request_id = 0
-        # Keep the WS read loop free to answer pings while a turn runs —
-        # blocking `await handle_message` caused keepalive timeouts and
-        # dropped follow-up messages when the socket then died.
         self._msg_queue: asyncio.Queue = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
         self._inflight: dict[str, asyncio.Event] = {}
         self._completed_replies: dict[str, str] = {}
+        self.server = RemoteControlServer()
+        self.mirrors: dict[str, SessionMirror] = {}
 
-    async def connect(self):
+    async def post(self, role: str, text: str, source: str = "plugin") -> None:
+        if not self.ws:
+            return
+        try:
+            await self.ws.send(json.dumps({
+                "type": "post", "channel": CHANNEL_ID, "role": role,
+                "text": text, "source": source,
+            }))
+        except Exception as exc:
+            _log(f"post failed: {exc}")
+
+    async def connect(self) -> None:
         ws_url = SIJBA_URL.replace("https://", "wss://").replace("http://", "ws://")
         ws_url = f"{ws_url}/api/plugin/ws?token={SIJBA_TOKEN}"
-        _log(f"Connecting to {ws_url} as {PLUGIN_ID}")
-        self.ws = await websockets.connect(
-            ws_url, ping_interval=30, ping_timeout=60, close_timeout=5,
-        )
-        _log("Connected!")
-
+        _log(f"Connecting as {PLUGIN_ID}")
+        self.ws = await websockets.connect(ws_url, ping_interval=30, ping_timeout=60, close_timeout=5)
         await self.ws.send(json.dumps({
             "type": "register",
             "plugin_id": PLUGIN_ID,
-            "capabilities": ["conversation", "tools", "files", "code", "agent"],
+            "capabilities": ["conversation", "relay"],
             "channels": {
                 CHANNEL_ID: {
-                    "label": f"Claude: {PROJECT_NAME}",
+                    "label": f"Remote Control: {PROJECT_NAME}",
                     "hint": (
-                        f"Claude Code agent for project '{PROJECT_NAME}' at {WORK_DIR}. "
-                        f"Trigger: '{PROJECT_NAME} ...'. In-channel commands: /archive, /pause, /reset, /kill, /log [n]."
+                        f"Claude Code Remote Control for '{PROJECT_NAME}' at {WORK_DIR}. "
+                        f"Phone prompts and answers appear here; send text to reach the active "
+                        f"RC session. Commands: /archive, /pause, /log [n]. "
+                        f"Writing relays into an auto-permission shell session — trusted senders only."
                     ),
                     "triggers": [PROJECT_NAME, CHANNEL_ID],
-                    "capabilities": ["code", "analysis", "debugging", "files", "terminal"],
+                    "capabilities": ["relay", "phone"],
                     "metadata": {"plugin": PLUGIN_NAME, "project": PROJECT_NAME, "working_dir": str(WORK_DIR)},
-                }
+                },
             },
         }))
         self._reconnect_backoff = 5
@@ -403,227 +543,172 @@ class PluginClient:
             finally:
                 self._msg_queue.task_done()
 
-    async def message_loop(self):
+    async def message_loop(self) -> None:
         try:
             async for raw in self.ws:
                 msg = json.loads(raw)
                 mtype = msg.get("type")
                 if mtype == "registered":
-                    _log(f"Plugin registered: {msg['plugin_id']}")
+                    _log(f"registered: {msg.get('plugin_id')}")
                 elif mtype == "channel_registered":
-                    _log(f"Channel registered: {msg['channel_id']} (ok={msg.get('ok')})")
+                    _log(f"channel {msg.get('channel_id')} ok={msg.get('ok')}")
                 elif mtype == "message":
-                    if _is_kill_command(msg["payload"]["text"]):
-                        # Bypasses _msg_queue on purpose: the one-turn-at-a-
-                        # time worker would otherwise queue /kill behind the
-                        # very turn it's meant to abort, making it useless
-                        # against a stuck/looping agent. Runs concurrently
-                        # with whatever the worker is currently doing.
-                        asyncio.create_task(self._handle_kill(msg))
-                    else:
-                        await self._msg_queue.put(msg)
+                    await self._msg_queue.put(msg)
                 elif mtype == "ping":
                     await self.ws.send(json.dumps({"type": "pong"}))
                 elif mtype == "error":
-                    _log(f"Server error: {msg.get('message')}")
+                    _log(f"server error: {msg.get('message')}")
         except websockets.ConnectionClosed:
-            _log("Connection closed")
-        except Exception as exc:
-            _log(f"Message loop error: {exc}")
-
-    def _remember_reply(self, envelope_id: str, text: str) -> None:
-        self._completed_replies[envelope_id] = text
-        while len(self._completed_replies) > 50:
-            oldest = next(iter(self._completed_replies))
-            self._completed_replies.pop(oldest, None)
+            _log("connection closed")
 
     async def _reply(self, channel_id: str, envelope_id: str, text: str) -> None:
-        try:
-            await self.ws.send(json.dumps({
-                "type": "reply", "channel": channel_id, "envelope_id": envelope_id,
-                "text": text, "continue": True,
-            }))
-        except Exception as exc:
-            _log(f"Failed to send reply: {exc}")
-
-    async def _handle_kill(self, msg: dict) -> None:
-        """See message_loop — runs outside _msg_queue so it takes effect
-        immediately against a running turn instead of waiting behind it."""
-        channel_id = msg["channel"]
-        envelope_id = msg["payload"]["envelope_id"]
-        killed = await self.session.kill()
-        self.session_started = False
-        reply = (
-            f"{PROJECT_NAME}: killed running turn, session reset — next message starts fresh."
-            if killed else
-            f"{PROJECT_NAME}: nothing running, session reset anyway."
-        )
-        _log(f"killed via /kill (had_running_turn={killed})")
-        self._remember_reply(envelope_id, reply)
-        await self._reply(channel_id, envelope_id, reply)
+        await self.ws.send(json.dumps({
+            "type": "reply", "channel": channel_id, "envelope_id": envelope_id,
+            "text": text, "continue": True,
+        }))
 
     async def _handle_local_command(self, channel_id: str, envelope_id: str, text: str) -> bool:
         cmd, _, rest = text[1:].partition(" ")
         cmd = cmd.lower().strip()
-
         if cmd == "log":
-            n = 10
-            if rest.strip().isdigit():
-                n = min(int(rest.strip()), len(_LOG_BUFFER) or 10)
-            lines = list(_LOG_BUFFER)[-n:]
-            reply = "\n".join(lines) or "(no logs yet)"
-            self._remember_reply(envelope_id, reply)
+            n = min(int(rest.strip()), len(_LOG_BUFFER)) if rest.strip().isdigit() else 10
+            reply = "\n".join(list(_LOG_BUFFER)[-n:]) or "(no logs yet)"
+            self._completed_replies[envelope_id] = reply
             await self._reply(channel_id, envelope_id, reply)
             return True
-
         if cmd in ("archive", "pause"):
             status = "archived" if cmd == "archive" else "paused"
             code = EXIT_ARCHIVED if cmd == "archive" else EXIT_PAUSED
-            try:
-                _set_registry_status(PROJECT_NAME, status)
-            except Exception as exc:
-                reply = f"Error updating registry: {exc}"
-                self._remember_reply(envelope_id, reply)
-                await self._reply(channel_id, envelope_id, reply)
-                return True
+            _set_registry_status(PROJECT_NAME, status)
             reply = f"{PROJECT_NAME} {status}. Stopping."
-            self._remember_reply(envelope_id, reply)
+            self._completed_replies[envelope_id] = reply
             await self._reply(channel_id, envelope_id, reply)
-            _log(f"{status} via /{cmd} — shutting down (exit {code})")
             self.exit_code = code
             self.shutdown_event.set()
             await self.ws.close()
             return True
-
-        if cmd == "reset":
-            await self.session.reset()
-            self.session_started = False
-            reply = f"{PROJECT_NAME} reset — next message starts fresh, no prior context."
-            self._remember_reply(envelope_id, reply)
-            await self._reply(channel_id, envelope_id, reply)
-            return True
-
         if cmd:
-            reply = (
-                "Unsupported here: /archive, /pause, /reset, /kill, /log [n]. "
-                "Anything else — just plain text."
-            )
-            self._remember_reply(envelope_id, reply)
+            reply = "Commands: /archive, /pause, /log [n]. Plain text relays to Remote Control."
+            self._completed_replies[envelope_id] = reply
             await self._reply(channel_id, envelope_id, reply)
             return True
         return False
 
-    async def handle_message(self, msg: dict):
+    async def handle_message(self, msg: dict) -> None:
         channel_id = msg["channel"]
         payload = msg["payload"]
         envelope_id = payload["envelope_id"]
-        text = payload["text"]
-        attachments = payload.get("attachments") or []
-
         if envelope_id in self._completed_replies:
-            _log(f"redelivery of completed envelope={envelope_id} — resending reply")
             await self._reply(channel_id, envelope_id, self._completed_replies[envelope_id])
             return
         if envelope_id in self._inflight:
-            _log(f"redelivery of in-flight envelope={envelope_id} — waiting")
             await self._inflight[envelope_id].wait()
             if envelope_id in self._completed_replies:
                 await self._reply(channel_id, envelope_id, self._completed_replies[envelope_id])
             return
-
         done = asyncio.Event()
         self._inflight[envelope_id] = done
         try:
-            await self._handle_message_inner(channel_id, envelope_id, text, attachments)
+            await self._handle_inner(channel_id, envelope_id, payload)
         finally:
             done.set()
             self._inflight.pop(envelope_id, None)
 
-    async def _handle_message_inner(
-        self, channel_id: str, envelope_id: str, text: str, attachments: list,
-    ) -> None:
-        text = _strip_trigger(text)
-        if not text and not attachments:
-            self._remember_reply(envelope_id, "")
-            await self._reply(channel_id, envelope_id, "")
-            return
-
+    async def _handle_inner(self, channel_id: str, envelope_id: str, payload: dict) -> None:
+        text = _strip_trigger(payload.get("text", ""))
+        attachments = payload.get("attachments") or []
         if text.lstrip().startswith("/"):
             if await self._handle_local_command(channel_id, envelope_id, text.lstrip()):
                 return
-
-        fetched = await _fetch_attachments(attachments, WORK_DIR)
-        note = ""
-        if fetched:
-            note += f"[Angehängte Datei(en): {', '.join(fetched)}]\n\n"
-        if len(fetched) < len(attachments):
-            # Surfaced in-chat rather than only in the plugin's own log — a
-            # silently-dropped attachment otherwise looks indistinguishable
-            # from "the agent just ignored the file".
-            note += f"[Achtung: {len(attachments) - len(fetched)} Anhang/Anhänge konnten nicht geladen werden]\n\n"
-        text = f"{note}{text}".strip()
-        if not text:
-            self._remember_reply(envelope_id, "")
+        if not text.strip() and not attachments:
+            self._completed_replies[envelope_id] = ""
             await self._reply(channel_id, envelope_id, "")
             return
 
-        if not self.session_started:
-            await self.session.start()
-            self.session_started = True
+        fetched = await _fetch_attachments(attachments, WORK_DIR)
+        parts = []
+        if fetched:
+            parts.append(f"[Anhänge: {', '.join(fetched)}]")
+        if text.strip():
+            parts.append(text.strip())
+        relay_text = "\n\n".join(parts)
+        if not relay_text:
+            self._completed_replies[envelope_id] = ""
+            await self._reply(channel_id, envelope_id, "")
+            return
 
-        async def _on_chunk(delta: str) -> None:
+        await self.server.ensure()
+        owned = _owned_sessions(self.server.root_pid)
+        active = _active_session(owned)
+        if not active:
+            reply = (
+                f"No Remote Control session open for '{PROJECT_NAME}'. "
+                f"Start one in the Claude app under Remote Control → {PROJECT_NAME}."
+            )
+            self._completed_replies[envelope_id] = reply
+            await self._reply(channel_id, envelope_id, reply)
+            return
+
+        name = str(active.get("name") or active["sessionId"][:8])
+        ok, detail = await relay_to_session(name, relay_text)
+        reply = f"→ sent to {name}" if ok else f"Relay failed: {detail}"
+        self._completed_replies[envelope_id] = reply
+        await self._reply(channel_id, envelope_id, reply)
+
+    async def _sync_mirrors(self) -> None:
+        owned = _owned_sessions(self.server.root_pid)
+        multi = len(owned) > 1
+        live = {s["sessionId"] for s in owned}
+        for sid in list(self.mirrors):
+            if sid not in live:
+                del self.mirrors[sid]
+        for meta in owned:
+            sid = meta["sessionId"]
+            if sid not in self.mirrors:
+                self.mirrors[sid] = SessionMirror(self, meta, multi)
+            else:
+                self.mirrors[sid].multi = multi
+                self.mirrors[sid].meta = meta
+                self.mirrors[sid].display_name = str(meta.get("name") or sid[:8])
+        for m in self.mirrors.values():
+            await m.poll()
+
+    async def _mirror_loop(self) -> None:
+        while not self.shutdown_event.is_set():
             try:
-                await self.ws.send(json.dumps({
-                    "type": "reply_chunk", "channel": channel_id, "envelope_id": envelope_id, "text": delta,
-                }))
+                await self._sync_mirrors()
             except Exception as exc:
-                _log(f"Failed to send reply_chunk: {exc}")
+                _log(f"mirror loop: {exc}")
+            await asyncio.sleep(SESSION_SCAN_SEC)
 
-        _log(f"handling envelope={envelope_id} text={text[:120]!r}")
-        self._request_id += 1
-        reply_text = ""
-        try:
-            response = await self.session.send(text, request_id=self._request_id, on_chunk=_on_chunk)
-            reply_text = response.get("text", "")
-        except Exception as exc:
-            reply_text = f"Error: {exc}"
-
-        self._remember_reply(envelope_id, reply_text)
-        await self._reply(channel_id, envelope_id, reply_text)
-
-    async def run_forever(self):
+    async def run_forever(self) -> None:
         loop = asyncio.get_event_loop()
 
-        def _request_shutdown() -> None:
-            # Setting the event alone doesn't unblock message_loop()'s
-            # `async for raw in self.ws` below — close the socket too, or
-            # shutdown just hangs until the connection drops on its own.
+        def _shutdown() -> None:
             self.shutdown_event.set()
-            if self.ws is not None:
+            if self.ws:
                 asyncio.ensure_future(self.ws.close())
 
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
-                loop.add_signal_handler(sig, _request_shutdown)
+                loop.add_signal_handler(sig, _shutdown)
             except NotImplementedError:
                 pass
+
+        await self.server.ensure()
+        asyncio.create_task(self.server.watch())
+        asyncio.create_task(self._mirror_loop())
 
         while not self.shutdown_event.is_set():
             try:
                 await self.connect()
             except Exception as exc:
-                _log(f"Connection failed: {exc}")
+                _log(f"connect failed: {exc}")
             if self.shutdown_event.is_set():
                 break
-            _log(f"Reconnecting in {self._reconnect_backoff}s...")
-            try:
-                await asyncio.wait_for(self.shutdown_event.wait(), timeout=self._reconnect_backoff)
-            except asyncio.TimeoutError:
-                pass
+            await asyncio.sleep(self._reconnect_backoff)
             self._reconnect_backoff = min(self._reconnect_backoff * 2, 300)
-
-        await self.session.close()
-        _log("Shutdown complete")
+        _log("shutdown complete")
 
 
 async def main() -> int:
