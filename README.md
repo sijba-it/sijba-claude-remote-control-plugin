@@ -12,7 +12,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install websockets
 
-export SIJBA_URL=https://sijba.edv-bartl.at
+export SIJBA_URL=https://<account>.sijba.eu
 export SIJBA_TOKEN=your-token-here
 export PROJECT_NAME=my-project
 export WORK_DIR=/path/to/my-project
