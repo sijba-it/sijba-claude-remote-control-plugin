@@ -203,6 +203,7 @@ class ClaudeSession:
     def __init__(self, work_dir: Path):
         self.work_dir = work_dir
         self.claude_session_id: str | None = None
+        self.current_proc: asyncio.subprocess.Process | None = None
 
     async def start(self):
         _log("Claude session ready (conversation mode)")
@@ -224,6 +225,7 @@ class ClaudeSession:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.work_dir,
             )
+            self.current_proc = proc
             final_text = ""
             stderr_buf = bytearray()
 
@@ -291,6 +293,8 @@ class ClaudeSession:
             if proc and proc.returncode is None:
                 proc.kill()
             return {"text": f"Error: {exc}", "request_id": request_id}
+        finally:
+            self.current_proc = None
 
     async def close(self):
         _log("Claude session closed")
@@ -301,10 +305,37 @@ class ClaudeSession:
         self.claude_session_id = None
         _log("Claude session reset")
 
+    async def kill(self) -> bool:
+        """Abort whatever turn is currently running, then reset — same
+        effect as /reset, plus actually terminating a still-running claude
+        invocation instead of waiting it out. Returns whether anything was
+        actually running to kill."""
+        proc = self.current_proc
+        killed = bool(proc and proc.returncode is None)
+        if killed:
+            proc.kill()
+        await self.reset()
+        return killed
+
 
 # ---------------------------------------------------------------------------
 # sijba plugin protocol (single project channel, self-registered)
 # ---------------------------------------------------------------------------
+
+def _strip_trigger(text: str) -> str:
+    for trigger in (PROJECT_NAME, CHANNEL_ID):
+        if text.lower().startswith(trigger.lower()):
+            return text[len(trigger):].strip()
+    return text.strip()
+
+
+def _is_kill_command(text: str) -> bool:
+    stripped = _strip_trigger(text)
+    if not stripped.startswith("/"):
+        return False
+    cmd, _, _ = stripped[1:].partition(" ")
+    return cmd.lower().strip() == "kill"
+
 
 class PluginClient:
     def __init__(self):
@@ -341,7 +372,7 @@ class PluginClient:
                     "label": f"Claude: {PROJECT_NAME}",
                     "hint": (
                         f"Claude Code agent for project '{PROJECT_NAME}' at {WORK_DIR}. "
-                        f"Trigger: '{PROJECT_NAME} ...'. In-channel commands: /archive, /pause, /log [n]."
+                        f"Trigger: '{PROJECT_NAME} ...'. In-channel commands: /archive, /pause, /reset, /kill, /log [n]."
                     ),
                     "triggers": [PROJECT_NAME, CHANNEL_ID],
                     "capabilities": ["code", "analysis", "debugging", "files", "terminal"],
@@ -382,7 +413,15 @@ class PluginClient:
                 elif mtype == "channel_registered":
                     _log(f"Channel registered: {msg['channel_id']} (ok={msg.get('ok')})")
                 elif mtype == "message":
-                    await self._msg_queue.put(msg)
+                    if _is_kill_command(msg["payload"]["text"]):
+                        # Bypasses _msg_queue on purpose: the one-turn-at-a-
+                        # time worker would otherwise queue /kill behind the
+                        # very turn it's meant to abort, making it useless
+                        # against a stuck/looping agent. Runs concurrently
+                        # with whatever the worker is currently doing.
+                        asyncio.create_task(self._handle_kill(msg))
+                    else:
+                        await self._msg_queue.put(msg)
                 elif mtype == "ping":
                     await self.ws.send(json.dumps({"type": "pong"}))
                 elif mtype == "error":
@@ -406,6 +445,22 @@ class PluginClient:
             }))
         except Exception as exc:
             _log(f"Failed to send reply: {exc}")
+
+    async def _handle_kill(self, msg: dict) -> None:
+        """See message_loop — runs outside _msg_queue so it takes effect
+        immediately against a running turn instead of waiting behind it."""
+        channel_id = msg["channel"]
+        envelope_id = msg["payload"]["envelope_id"]
+        killed = await self.session.kill()
+        self.session_started = False
+        reply = (
+            f"{PROJECT_NAME}: killed running turn, session reset — next message starts fresh."
+            if killed else
+            f"{PROJECT_NAME}: nothing running, session reset anyway."
+        )
+        _log(f"killed via /kill (had_running_turn={killed})")
+        self._remember_reply(envelope_id, reply)
+        await self._reply(channel_id, envelope_id, reply)
 
     async def _handle_local_command(self, channel_id: str, envelope_id: str, text: str) -> bool:
         cmd, _, rest = text[1:].partition(" ")
@@ -450,7 +505,7 @@ class PluginClient:
 
         if cmd:
             reply = (
-                "Unsupported here: /archive, /pause, /reset, /log [n]. "
+                "Unsupported here: /archive, /pause, /reset, /kill, /log [n]. "
                 "Anything else — just plain text."
             )
             self._remember_reply(envelope_id, reply)
@@ -487,10 +542,7 @@ class PluginClient:
     async def _handle_message_inner(
         self, channel_id: str, envelope_id: str, text: str, attachments: list,
     ) -> None:
-        for trigger in (PROJECT_NAME, CHANNEL_ID):
-            if text.lower().startswith(trigger.lower()):
-                text = text[len(trigger):].strip()
-                break
+        text = _strip_trigger(text)
         if not text and not attachments:
             self._remember_reply(envelope_id, "")
             await self._reply(channel_id, envelope_id, "")
