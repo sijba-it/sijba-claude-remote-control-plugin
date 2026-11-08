@@ -41,7 +41,10 @@ CLAUDE_CMD = os.environ.get("CLAUDE_CMD", "claude")
 BOT_FLUSH_IDLE_SEC = 15
 SERVER_WATCH_SEC = 30
 SESSION_SCAN_SEC = 2
+SESSION_WAIT_SEC = 45
 MAX_CHARS_TO_UI = 8000
+REMOTE_CONTROL_CAPACITY = max(1, int(os.environ.get("REMOTE_CONTROL_CAPACITY", "1")))
+CONFIG_PATH = WORK_DIR / ".sijba-remote-control.json"
 
 FALLBACK_SUBTYPES = ("model_fallback", "model_refusal_fallback", "model_consent_fallback")
 
@@ -150,6 +153,83 @@ def _pane_pid() -> int | None:
         return None
 
 
+def _socket_live(path: str | None) -> bool:
+    if not path:
+        return False
+    return Path(path).exists()
+
+
+def _session_live(meta: dict, root_pid: int | None) -> bool:
+    pid = meta.get("pid")
+    if not isinstance(pid, int) or not _pid_alive(pid):
+        return False
+    if root_pid and not _is_descendant(pid, root_pid):
+        return False
+    return _socket_live(meta.get("messagingSocketPath"))
+
+
+def _load_rc_config() -> dict:
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        return json.loads(CONFIG_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_rc_config(cfg: dict) -> None:
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+
+def _session_display(meta: dict) -> str:
+    return str(meta.get("name") or meta["sessionId"][:8])
+
+
+def _pick_session(
+    sessions: list[dict],
+    *,
+    explicit: str | None = None,
+    preferred: str | None = None,
+) -> dict | None:
+    """Choose a live RC session. explicit = user @name / name: prefix."""
+    if not sessions:
+        return None
+    if explicit:
+        want = explicit.lower()
+        for s in sessions:
+            if _session_display(s).lower() == want:
+                return s
+        return None
+    if preferred:
+        want = preferred.lower()
+        for s in sessions:
+            if _session_display(s).lower() == want:
+                return s
+    if len(sessions) == 1:
+        return sessions[0]
+
+    def _rank(s: dict) -> tuple[int, float]:
+        busy = 1 if s.get("status") == "busy" else 0
+        return (busy, float(s.get("updatedAt") or 0))
+
+    return max(sessions, key=_rank)
+
+
+def _parse_session_prefix(text: str, live_names: list[str]) -> tuple[str | None, str]:
+    """If the message starts with @session or 'session: …', peel it off."""
+    text = text.strip()
+    if text.startswith("@"):
+        head, _, rest = text[1:].partition(" ")
+        if head and (not live_names or head.lower() in {n.lower() for n in live_names}):
+            return head, rest.strip()
+    for name in sorted(live_names, key=len, reverse=True):
+        for sep in (": ", ":"):
+            prefix = f"{name}{sep}"
+            if text.lower().startswith(prefix.lower()):
+                return name, text[len(prefix):].strip()
+    return None, text
+
+
 # ---------------------------------------------------------------------------
 # Remote-control server (tmux + claude remote-control)
 # ---------------------------------------------------------------------------
@@ -169,7 +249,9 @@ class RemoteControlServer:
     async def _spawn(self) -> None:
         argv = [
             CLAUDE_CMD, "remote-control", "--name", PROJECT_NAME,
-            "--permission-mode", "auto", "--capacity", "2", "--spawn=same-dir",
+            "--permission-mode", "auto",
+            "--capacity", str(REMOTE_CONTROL_CAPACITY),
+            "--spawn=same-dir",
         ]
         inner = " ".join(shlex.quote(a) for a in argv)
         tmux_cmd = (
@@ -231,22 +313,21 @@ def _owned_sessions(root_pid: int | None) -> list[dict]:
                 continue
         except OSError:
             continue
+        if not _session_live(meta, root_pid):
+            continue
         out.append(meta)
     return out
 
 
-def _active_session(sessions: list[dict]) -> dict | None:
-    best: dict | None = None
-    best_mtime = 0.0
-    for s in sessions:
-        p = _jsonl_path(s["sessionId"])
-        if not p.exists():
-            continue
-        m = p.stat().st_mtime
-        if m >= best_mtime:
-            best_mtime = m
-            best = s
-    return best
+async def _wait_for_live_session(server: RemoteControlServer, timeout: float = SESSION_WAIT_SEC) -> list[dict]:
+    """After the RC server starts it pre-creates a session (--create-session-in-dir)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        owned = _owned_sessions(server.root_pid)
+        if owned:
+            return owned
+        await asyncio.sleep(0.5)
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -395,21 +476,24 @@ class SessionMirror:
 # Relay sijba → active RC session (haiku SendMessage helper)
 # ---------------------------------------------------------------------------
 
-def _relay_prompt(session_name: str, text: str) -> str:
+def _relay_prompt(session_name: str, text: str, *, candidates: list[str]) -> str:
+    listed = ", ".join(repr(n) for n in candidates) if candidates else "(none)"
     return (
-        "Deliver a cross-session message using only SendMessage (use ToolSearch to find it if needed). "
-        f"Send to the Claude Code session named {session_name!r}. "
-        "The message body must be exactly:\n\n"
-        f"Robert via sijba: {text}\n\n"
-        "Do not use shell or any other tools."
+        "Relay a message with SendMessage only (use ToolSearch to find ListAgents/SendMessage if needed). "
+        "STEP 1: List live Remote Control agents (ListAgents or equivalent). "
+        f"STEP 2: Send ONLY if {session_name!r} appears in that list. "
+        f"If it is missing, reply with one line: RELAY_FAIL: target not in ListAgents ({listed}). "
+        "Do not message stale session names. "
+        f"The message body for SendMessage must be exactly:\n\nRobert via sijba: {text}\n\n"
+        "No shell, no other tools."
     )
 
 
-async def relay_to_session(session_name: str, text: str) -> tuple[bool, str]:
-    prompt = _relay_prompt(session_name, text)
+async def relay_to_session(session_name: str, text: str, *, candidates: list[str]) -> tuple[bool, str]:
+    prompt = _relay_prompt(session_name, text, candidates=candidates)
     cmd = [
         CLAUDE_CMD, "-p", "--model", "haiku", "--permission-mode", "dontAsk",
-        "--allowedTools", "SendMessage", "ToolSearch",
+        "--allowedTools", "SendMessage", "ToolSearch", "ListAgents",
         "--output-format", "json", prompt,
     ]
     proc = await asyncio.create_subprocess_exec(
@@ -427,6 +511,12 @@ async def relay_to_session(session_name: str, text: str) -> tuple[bool, str]:
         return False, err or f"exit {proc.returncode}"
     if err:
         _log(f"relay stderr: {err[:200]}")
+    out = stdout.decode(errors="replace")
+    if "RELAY_FAIL" in out or "not in ListAgents" in out:
+        return False, "target not listed by ListAgents"
+    if proc.returncode == 0 and "SendMessage" not in out and "RELAY_FAIL" not in out:
+        # No tool trace — treat as success only if nothing obviously failed
+        pass
     return True, "ok"
 
 
@@ -576,6 +666,39 @@ class PluginClient:
             self._completed_replies[envelope_id] = reply
             await self._reply(channel_id, envelope_id, reply)
             return True
+        if cmd == "sessions":
+            await self.server.ensure()
+            owned = _owned_sessions(self.server.root_pid)
+            if not owned:
+                reply = (
+                    f"No live Remote Control session for '{PROJECT_NAME}' yet — "
+                    f"open it on your phone, or wait ~{SESSION_WAIT_SEC}s after server start."
+                )
+            else:
+                lines = [
+                    f"- {_session_display(s)} ({s.get('status', '?')})"
+                    for s in owned
+                ]
+                reply = "Live sessions:\n" + "\n".join(lines)
+                if len(owned) > 1:
+                    reply += "\n\nSend with @<name> … or <name>: …"
+            self._completed_replies[envelope_id] = reply
+            await self._reply(channel_id, envelope_id, reply)
+            return True
+
+        if cmd == "session":
+            name = rest.strip()
+            if not name:
+                reply = f"Default session is {_load_rc_config().get('default_session') or '(auto)'}. Usage: /session <name>"
+            else:
+                cfg = _load_rc_config()
+                cfg["default_session"] = name
+                _save_rc_config(cfg)
+                reply = f"Default RC session set to {name!r} (if it is live)."
+            self._completed_replies[envelope_id] = reply
+            await self._reply(channel_id, envelope_id, reply)
+            return True
+
         if cmd in ("archive", "pause"):
             status = "archived" if cmd == "archive" else "paused"
             code = EXIT_ARCHIVED if cmd == "archive" else EXIT_PAUSED
@@ -588,7 +711,10 @@ class PluginClient:
             await self.ws.close()
             return True
         if cmd:
-            reply = "Commands: /archive, /pause, /log [n]. Plain text relays to Remote Control."
+            reply = (
+                "Commands: /archive, /pause, /log [n], /sessions, /session <name>. "
+                "With capacity>1: @<session> … or <session>: …"
+            )
             self._completed_replies[envelope_id] = reply
             await self._reply(channel_id, envelope_id, reply)
             return True
@@ -638,20 +764,50 @@ class PluginClient:
             return
 
         await self.server.ensure()
-        owned = _owned_sessions(self.server.root_pid)
-        active = _active_session(owned)
-        if not active:
+        owned = await _wait_for_live_session(self.server) if not _owned_sessions(self.server.root_pid) else _owned_sessions(self.server.root_pid)
+        if not owned:
             reply = (
-                f"No Remote Control session open for '{PROJECT_NAME}'. "
-                f"Start one in the Claude app under Remote Control → {PROJECT_NAME}."
+                f"No live Remote Control session for '{PROJECT_NAME}' yet. "
+                f"The server is running in tmux {TMUX_SESSION!r} and should pre-create one; "
+                f"otherwise open Remote Control → {PROJECT_NAME} on your phone."
             )
             self._completed_replies[envelope_id] = reply
             await self._reply(channel_id, envelope_id, reply)
             return
 
-        name = str(active.get("name") or active["sessionId"][:8])
-        ok, detail = await relay_to_session(name, relay_text)
-        reply = f"→ sent to {name}" if ok else f"Relay failed: {detail}"
+        live_names = [_session_display(s) for s in owned]
+        explicit, relay_text = _parse_session_prefix(relay_text, live_names)
+        cfg = _load_rc_config()
+        target = _pick_session(
+            owned,
+            explicit=explicit,
+            preferred=cfg.get("default_session"),
+        )
+        if explicit and not target:
+            reply = f"Unknown session {explicit!r}. Live: {', '.join(live_names)} (/sessions)"
+            self._completed_replies[envelope_id] = reply
+            await self._reply(channel_id, envelope_id, reply)
+            return
+        if len(owned) > 1 and not explicit and not cfg.get("default_session"):
+            reply = f"Which session? Live: {', '.join(live_names)} — use @name … or /session <name>"
+            self._completed_replies[envelope_id] = reply
+            await self._reply(channel_id, envelope_id, reply)
+            return
+        if not target:
+            target = owned[0]
+
+        name = _session_display(target)
+        ok, detail = await relay_to_session(name, relay_text, candidates=live_names)
+        if not ok and len(owned) > 1:
+            for alt in owned:
+                alt_name = _session_display(alt)
+                if alt_name == name:
+                    continue
+                ok, detail = await relay_to_session(alt_name, relay_text, candidates=live_names)
+                if ok:
+                    name = alt_name
+                    break
+        reply = f"→ sent to {name}" if ok else f"Relay failed: {detail} (live: {', '.join(live_names)})"
         self._completed_replies[envelope_id] = reply
         await self._reply(channel_id, envelope_id, reply)
 
